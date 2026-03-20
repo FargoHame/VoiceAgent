@@ -1,0 +1,4 @@
+websockets>=12.0
+groq>=0.4.2
+sounddevice
+python-dotenv>=1.0.1
