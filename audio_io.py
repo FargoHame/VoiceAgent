@@ -1,96 +1,134 @@
-import sounddevice as sd
-import numpy as np
+"""
+Audio I/O manager.
+
+Implements both MicrophoneSource and AudioSink protocols.
+
+Design constraints:
+  - Pure hardware I/O — no knowledge of STT, TTS, LLM, or orchestrator.
+  - Microphone runs in a dedicated OS thread (sounddevice callback model).
+  - Playback is an async coroutine driven by a queue.
+  - Cancellation of playback via asyncio.Event: drains the queue, stops output.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import logging
+import queue
+import sounddevice as sd
+
 from config import Config
 
 logger = logging.getLogger(__name__)
 
+
 class AudioManager:
-    """Uses sounddevice for robust, deployment-ready audio I/O."""
-    
-    def __init__(self) -> None:
-        self.stream_input = None
-        self.stream_output = None
-        self.interrupt_event = asyncio.Event()
-        self._is_playing = False  # Track playback state internally
+    """Hardware microphone capture and speaker playback."""
 
-    @property
-    def is_playing(self) -> bool:
-        """Staff-fix: Property requested by core.orchestrator."""
-        return self._is_playing
+    # ------------------------------------------------------------------
+    # MicrophoneSource protocol
+    # ------------------------------------------------------------------
 
-    def start_microphone(self, queue: asyncio.Queue) -> None:
-        """Callback-based recording. More stable than threaded loops."""
-        def callback(indata, frames, time, status):
+    def start(self, out: asyncio.Queue[bytes | None]) -> None:
+        """
+        Blocking.  Run in a dedicated thread.
+
+        Opens a sounddevice RawInputStream, forwards PCM chunks to *out*.
+        Returns only when the stream becomes inactive (hardware error / shutdown).
+        """
+        def _callback(
+            indata: bytes,
+            frames: int,
+            time: object,
+            status: sd.CallbackFlags,
+        ) -> None:
             if status:
-                logger.warning(f"Microphone status: {status}")
-            # Directly convert the raw buffer to bytes for stability
-            queue.put_nowait(bytes(indata))
+                logger.warning("Mic status: %s", status)
+            # put_nowait is safe from a C-extension callback thread.
+            out.put_nowait(bytes(indata))
 
         try:
-            self.stream_input = sd.RawInputStream(
+            with sd.RawInputStream(
                 samplerate=Config.AUDIO.RATE,
                 blocksize=Config.AUDIO.CHUNK,
-                device=None,
                 channels=Config.AUDIO.CHANNELS,
-                dtype='int16',
-                callback=callback
-            )
-            with self.stream_input:
-                logger.info("Microphone hardware active via sounddevice.")
-                while self.stream_input.active:
-                    sd.sleep(100)
-        except Exception as e:
-            logger.error(f"Microphone hardware error: {e}")
+                dtype="int16",
+                callback=_callback,
+            ):
+                logger.info("Microphone active.")
+                # Block until the stream becomes inactive.
+                while True:
+                    sd.sleep(200)
+        except Exception as exc:
+            logger.error("Microphone error: %s", exc)
+        finally:
+            # Signal downstream that the mic is gone.
+            out.put_nowait(None)
 
-    async def play_audio(self, audio_queue: asyncio.Queue) -> None:
-        """Non-blocking playback using a generator-based output stream."""
+    # ------------------------------------------------------------------
+    # AudioSink protocol
+    # ------------------------------------------------------------------
+
+    async def run(
+        self,
+        audio: queue.Queue[bytes | None],
+        cancel: asyncio.Event,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._playback_thread, audio, cancel, loop)
+
+    def _playback_thread(
+        self,
+        audio: queue.Queue[bytes | None],
+        cancel: asyncio.Event,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Runs entirely in a thread — no event loop bouncing per chunk."""
+        stream = sd.RawOutputStream(
+            samplerate=Config.AUDIO.RATE,
+            blocksize=Config.AUDIO.CHUNK,
+            channels=Config.AUDIO.CHANNELS,
+            dtype="int16",
+        )
+        stream.start()
+        logger.info("Speaker active.")
+
         try:
-            self.stream_output = sd.RawOutputStream(
-                samplerate=Config.AUDIO.RATE,
-                blocksize=Config.AUDIO.CHUNK,
-                device=None,
-                channels=Config.AUDIO.CHANNELS,
-                dtype='int16'
-            )
-            self.stream_output.start()
-            logger.info("Speaker hardware ready via sounddevice.")
-
             while True:
-                if self.interrupt_event.is_set():
-                    while not audio_queue.empty():
-                        audio_queue.get_nowait()
-                        audio_queue.task_done()
-                    self.interrupt_event.clear()
-                    self._is_playing = False
+                if cancel.is_set():
+                    self._drain(audio)
+                    cancel.clear()
+                    logger.debug("Playback interrupted; queue drained.")
+
+                try:
+                    chunk = audio.get_nowait()
+                except queue.Empty:
+                    # Nothing ready — yield briefly to avoid busy-spin.
+                    import time
+                    time.sleep(0.005)
                     continue
 
-                chunk = await audio_queue.get()
-                if chunk is None: break
-                
-                # Update status for orchestrator
-                self._is_playing = True
-                self.stream_output.write(chunk)
-                audio_queue.task_done()
-                
-                # If we've finished the current burst of audio, set playing to False
-                if audio_queue.empty():
-                    self._is_playing = False
+                if chunk is None:
+                    break
 
-        except Exception as e:
-            logger.error(f"Playback error: {e}")
-            self._is_playing = False
+                stream.write(chunk)
+                
+
+        except Exception as exc:
+            logger.error("Playback error: %s", exc)
         finally:
-            self._is_playing = False
-            if self.stream_output:
-                self.stream_output.stop()
-                self.stream_output.close()
+            stream.stop()
+            stream.close()
+            logger.info("Speaker closed.")
+        # ------------------------------------------------------------------
+        # Private helpers
+        # ------------------------------------------------------------------
 
-    def interrupt(self) -> None:
-        self.interrupt_event.set()
-
-    def shutdown(self) -> None:
-        if self.stream_input: self.stream_input.stop()
-        if self.stream_output: self.stream_output.stop()
-        logger.info("Audio system offline.")
+    @staticmethod
+    def _drain(q: queue.Queue) -> None:
+        while not q.empty():
+            try:
+                q.get_nowait()
+                q.task_done()
+            except asyncio.QueueEmpty:
+                break
